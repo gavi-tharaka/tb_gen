@@ -41,7 +41,7 @@
   </script>
 
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" />
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="styles.css?v=20261105_5" />
 </head>
 
 <body class="bg-paper text-ink font-sans antialiased min-h-screen">
@@ -456,18 +456,18 @@
               </div>
 
               <div class="grid sm:grid-cols-3 gap-3 sm:gap-4">
-                <!-- 1. System GL Balance (Read-only here; entered in GL Balances tab) -->
+                <!-- 1. System GL Balance (Synced with GL Balances tab) -->
                 <div class="p-3.5 rounded-xl bg-blue-50/70 border border-blue-200 space-y-1.5">
                   <div class="flex items-center justify-between gap-1">
-                    <span class="field-label !mb-0 text-blue-950 font-semibold flex items-center gap-1.5">
+                    <label for="glBalanceInput" class="field-label !mb-0 text-blue-950 font-semibold flex items-center gap-1.5">
                       <i class="fa-solid fa-building-columns text-blue-600"></i> System GL Balance
-                    </span>
-                    <button id="btnGoToGlBalances" type="button" class="text-[11px] font-semibold text-blue-700 hover:text-blue-900 underline flex items-center gap-1" title="Enter or edit Current Month GL Balance in GL Balances tab">
-                      Edit <i class="fa-solid fa-arrow-right text-[10px]"></i>
+                    </label>
+                    <button id="btnGoToGlBalances" type="button" class="text-[11px] font-semibold text-blue-700 hover:text-blue-900 underline flex items-center gap-1" title="View all in GL Balances tab">
+                      GL Balances <i class="fa-solid fa-arrow-right text-[10px]"></i>
                     </button>
                   </div>
-                  <input id="glBalanceInput" type="text" readonly class="field-input font-mono text-right text-base font-bold bg-white text-blue-950 cursor-default" placeholder="Not entered yet" />
-                  <p id="glBalanceSourceHint" class="text-[11px] text-blue-700/80">Entered in GL Balances tab</p>
+                  <input id="glBalanceInput" type="text" inputmode="decimal" class="field-input font-mono text-right text-base font-bold bg-white text-blue-950" placeholder="Enter System GL Balance..." />
+                  <p id="glBalanceSourceHint" class="text-[11px] text-blue-700/80">Fixed from system (synced with GL Balances tab)</p>
                 </div>
 
                 <!-- 2. Trial Balance Total (Sum of Schedule Items) -->
@@ -502,10 +502,59 @@
                   <span>System GL Balance and Trial Balance Total are currently equal (0.00). Enter the actual System GL Balance in the <strong>GL Balances</strong> tab if there is a difference.</span>
                 </div>
                 <div>
-                  <label for="diffNote" class="field-label text-amber-900 font-semibold">
-                    <i class="fa-solid fa-comment-dots mr-1"></i> Reason for Difference (Printed in "Difference (If Any)")
+                  <label id="diffNoteLabel" class="field-label text-amber-900 font-semibold">
+                    <i class="fa-solid fa-comment-dots mr-1"></i> Optional Note (Printed in place of "We hereby certify..." when imbalanced)
                   </label>
-                  <textarea id="diffNote" rows="2" class="field-input bg-white" placeholder="e.g. Forgot to write Rs. 750.00 entry in Trial Balance book"></textarea>
+                  <div class="rt-wrapper bg-white border border-slate-300 rounded-lg overflow-hidden focus-within:border-blue-600 focus-within:ring-2 focus-within:ring-blue-600/20">
+                    <div id="diffNoteToolbar" class="rt-toolbar flex flex-wrap items-center gap-1 px-2 py-1.5 bg-slate-100 border-b border-slate-200 text-xs" role="toolbar" aria-label="Optional Note text formatting">
+                      <button type="button" class="rt-btn" data-rt-cmd="bold" title="Bold (Ctrl+B)" aria-label="Bold">
+                        <i class="fa-solid fa-bold"></i>
+                      </button>
+                      <button type="button" class="rt-btn" data-rt-cmd="italic" title="Italic (Ctrl+I)" aria-label="Italic">
+                        <i class="fa-solid fa-italic"></i>
+                      </button>
+                      <button type="button" class="rt-btn" data-rt-cmd="underline" title="Underline (Ctrl+U)" aria-label="Underline">
+                        <i class="fa-solid fa-underline"></i>
+                      </button>
+
+                      <span class="h-4 w-px bg-slate-300 mx-1" aria-hidden="true"></span>
+
+                      <button type="button" class="rt-btn px-1.5 font-bold" data-rt-size-step="-1" title="Decrease font size of selected text" aria-label="Decrease font size">
+                        A<sup class="text-[9px]">-</sup>
+                      </button>
+                      <select id="rtFontSizeSelect" class="bg-white border border-slate-300 rounded px-1.5 py-0.5 text-xs font-mono text-slate-700 cursor-pointer" title="Font size for selected text" aria-label="Font size">
+                        <option value="8">8 pt</option>
+                        <option value="9">9 pt</option>
+                        <option value="10" selected>10 pt</option>
+                        <option value="11">11 pt</option>
+                        <option value="12">12 pt</option>
+                        <option value="14">14 pt</option>
+                        <option value="16">16 pt</option>
+                        <option value="18">18 pt</option>
+                      </select>
+                      <button type="button" class="rt-btn px-1.5 font-bold" data-rt-size-step="1" title="Increase font size of selected text" aria-label="Increase font size">
+                        A<sup class="text-[9px]">+</sup>
+                      </button>
+
+                      <span class="h-4 w-px bg-slate-300 mx-1" aria-hidden="true"></span>
+
+                      <button type="button" class="rt-btn" data-rt-cmd="insertUnorderedList" title="Bulleted list" aria-label="Bulleted list">
+                        <i class="fa-solid fa-list-ul"></i>
+                      </button>
+                      <button type="button" class="rt-btn" data-rt-cmd="insertOrderedList" title="Numbered list" aria-label="Numbered list">
+                        <i class="fa-solid fa-list-ol"></i>
+                      </button>
+
+                      <span class="h-4 w-px bg-slate-300 mx-1" aria-hidden="true"></span>
+
+                      <button type="button" class="rt-btn text-slate-500 hover:text-rose-600" data-rt-cmd="removeFormat" title="Clear formatting" aria-label="Clear formatting">
+                        <i class="fa-solid fa-eraser"></i>
+                      </button>
+                    </div>
+                    <div id="diffNote" contenteditable="true" role="textbox" aria-multiline="true" aria-labelledby="diffNoteLabel"
+                         class="rt-editor p-2.5 min-h-[80px] max-h-[220px] overflow-y-auto text-sm text-slate-800 focus:outline-none"
+                         data-placeholder="Optional note to appear above the signature box instead of the certification text"></div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -547,7 +596,7 @@
                 <i class="fa-solid fa-ban mt-0.5 text-sm text-rose-600"></i>
                 <div>
                   <strong class="font-bold block text-rose-900">Certification Statement Omitted (Balances Do Not Tally)</strong>
-                  Because System GL Balance and Trial Balance do not match, the certification paragraph will not be printed for this GL.
+                  Enter an <strong>Optional Note</strong> above if you want a custom note/reason printed here in place of the certification text.
                 </div>
               </div>
 
@@ -929,7 +978,7 @@
        ExcelJS, JSZip, jsPDF and AutoTable are now loaded ON DEMAND by app.js
        (only when importing / exporting), which makes the first page load much faster.
        ========================================================= -->
-  <script src="data.js"></script>
-  <script type="module" src="app.js"></script>
+  <script src="data.js?v=20261105_5"></script>
+  <script type="module" src="app.js?v=20261105_5"></script>
 </body>
 </html>

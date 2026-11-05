@@ -23,8 +23,9 @@
 import {
   numberToWords, parseAmount, toCents, formatMoney,
   normalizeDate, isValidDate, parsePastedRows, parseWorkbookFile,
-  buildWorkbookBuffer, buildAndSavePdf
-} from "./excel-tools.js";
+  buildWorkbookBuffer, buildAndSavePdf,
+  plainTextFromHtml, sanitizeRichNoteHtml
+} from "./excel-tools.js?v=20261105_5";
 
 const CFG = window.APP_CONFIG;
 const MASTER = window.MASTER_GL_LIST.slice().sort(function (a, b) { return a.glNo.localeCompare(b.glNo); });
@@ -530,22 +531,16 @@ function calcGl(g) {
   // System GL Balance comes strictly from the Current Month GL Balance entered in GL Balances tab (fixed from system).
   const gl = hasSysGl ? toCents(sysNum) : (g.override ? 0 : tb);
   const diff = gl - tb;
-  const note = String(g.diffNote || "").trim();
+  const note = plainTextFromHtml(g.diffNote || "");
   const hasDiscrepancy = diff !== 0 || (!!g.override && note !== "");
   return { tb: tb, gl: gl, diff: diff, hasSysGl: hasSysGl, sysRaw: sysRaw, hasDiscrepancy: hasDiscrepancy };
 }
 
 function differenceText(g, c) {
   if (g.mode !== "balance") return "NIL";
-  const note = String(g.diffNote || "").trim();
   if (c.diff !== 0) {
-    const amtStr = formatMoney(Math.abs(c.diff));
-    if (note) {
-      return note.indexOf(amtStr) !== -1 ? note : amtStr + " - " + note;
-    }
-    return amtStr;
+    return numberToWords(Math.abs(c.diff) / 100);
   }
-  if (g.override && note) return note;
   return "Nil";
 }
 
@@ -624,7 +619,7 @@ function glIssues(glNo) {
   if (g.mode === "balance") {
     const items = cleanItems(g);
     const c = calcGl(g);
-    const note = String(g.diffNote || "").trim();
+    const note = plainTextFromHtml(g.diffNote || "");
     if (!items.length && (!c.hasSysGl || c.gl === 0)) {
       p.push("Marked Has Balance but has no schedule items and no System GL Balance.");
     }
@@ -651,12 +646,7 @@ function glWarnings(glNo) {
   const cmp = getGlComparison(glNo);
   const w = [];
   if (g.mode === "balance" && c.diff !== 0) {
-    const note = String(g.diffNote || "").trim();
-    if (!note) {
-      w.push("System GL Balance (" + formatMoney(c.gl) + ") and Trial Balance (" + formatMoney(c.tb) + ") differ by " + formatMoney(Math.abs(c.diff)) + " without a reason/explanation. The certification clause will be omitted.");
-    } else {
-      w.push("Discrepancy of " + formatMoney(Math.abs(c.diff)) + " between System GL (" + formatMoney(c.gl) + ") and Trial Balance (" + formatMoney(c.tb) + "). The certification clause will be omitted.");
-    }
+    w.push("Discrepancy of " + numberToWords(Math.abs(c.diff) / 100) + " (" + formatMoney(Math.abs(c.diff)) + ") between System GL (" + formatMoney(c.gl) + ") and Trial Balance (" + formatMoney(c.tb) + "). The certification clause will be omitted.");
   } else if (cmp.hasTarget && !cmp.glMatchesTarget) {
     w.push("GL balance in the schedule (" + formatMoney(cmp.glCents) + ") is not equal to the entered current month-end balance (" + formatMoney(cmp.targetCents) + ").");
   }
@@ -812,7 +802,30 @@ async function verifyDatabaseAccess(user) {
   }
 }
 
-/** Fetches active month-end metadata (`_meta`) from Firebase on sign-in. */
+/** Saves the current user's Officer Name & Service Number to Firestore `_meta.officers[email]` */
+async function saveOfficerProfileToCloud() {
+  if (!isAuthorizedSession || !fb || !currentUser || !navigator.onLine) return;
+  const emailKey = String(currentUser.email || "").trim().toLowerCase();
+  if (!emailKey) return;
+  try {
+    const fs = fb.fs;
+    const officersUpdate = {};
+    officersUpdate[emailKey] = {
+      officerName: String(state.officerName || "").trim(),
+      serviceNo: String(state.serviceNo || "").trim(),
+      email: emailKey,
+      updatedAt: fs.serverTimestamp()
+    };
+    await fs.setDoc(fs.doc(fb.db, CFG.firestore.collection, META_DOC_ID), {
+      officers: officersUpdate
+    }, { merge: true });
+  } catch (e) {
+    console.warn("Could not auto-save officer profile to cloud:", e);
+  }
+}
+const saveOfficerProfileSoon = debounce(saveOfficerProfileToCloud, 800);
+
+/** Fetches active month-end metadata & per-Gmail Officer profile (`_meta`) from Firebase on sign-in. */
 async function syncFirebaseMeta() {
   if (!fb) return;
   try {
@@ -820,6 +833,7 @@ async function syncFirebaseMeta() {
     const getDocFn = typeof fs.getDocFromServer === "function" ? fs.getDocFromServer : fs.getDoc;
     const metaRef = fs.doc(fb.db, CFG.firestore.collection, META_DOC_ID);
     const metaSnap = await getDocFn(metaRef).catch(function () { return fs.getDoc(metaRef); });
+    const emailKey = String((currentUser && currentUser.email) || "").trim().toLowerCase();
     if (metaSnap && metaSnap.exists()) {
       const m = metaSnap.data() || {};
       if (m.currentMonthEnd && isValidDate(normalizeDate(m.currentMonthEnd))) {
@@ -836,6 +850,18 @@ async function syncFirebaseMeta() {
         });
         pruneToSixMonths(state);
       }
+      // Load Officer Name & Service Number saved for this specific Gmail account
+      const officersMap = (m.officers && typeof m.officers === "object") ? m.officers : {};
+      const cloudOfficer = emailKey ? officersMap[emailKey] : null;
+      if (cloudOfficer && typeof cloudOfficer === "object") {
+        if (typeof cloudOfficer.officerName === "string") state.officerName = cloudOfficer.officerName;
+        if (typeof cloudOfficer.serviceNo === "string") state.serviceNo = cloudOfficer.serviceNo;
+        persistNow();
+      } else if (emailKey && (state.officerName || state.serviceNo)) {
+        saveOfficerProfileToCloud();
+      }
+    } else if (emailKey && (state.officerName || state.serviceNo)) {
+      saveOfficerProfileToCloud();
     }
   } catch (e) { /* ignore if _meta does not exist yet */ }
 }
@@ -933,14 +959,25 @@ async function saveToCloud() {
   try {
     const fs = fb.fs;
 
-    // 1. Save _meta document (active Current Month-End & 6-month list)
+    // 1. Save _meta document (active Current Month-End, 6-month list & per-Gmail Officer profile)
     if (state.metaDirty || glNos.length) {
-      await fs.setDoc(fs.doc(fb.db, CFG.firestore.collection, META_DOC_ID), {
+      const emailKey = String(currentUser.email || "").trim().toLowerCase();
+      const metaPayload = {
         currentMonthEnd: state.tbDate || "",
         savedMonths: getSavedMonthsList(state).slice(-MAX_SAVED_MONTHS),
         updatedBy: currentUser.email || "",
         updatedAt: fs.serverTimestamp()
-      }, { merge: true });
+      };
+      if (emailKey) {
+        metaPayload.officers = {};
+        metaPayload.officers[emailKey] = {
+          officerName: String(state.officerName || "").trim(),
+          serviceNo: String(state.serviceNo || "").trim(),
+          email: emailKey,
+          updatedAt: fs.serverTimestamp()
+        };
+      }
+      await fs.setDoc(fs.doc(fb.db, CFG.firestore.collection, META_DOC_ID), metaPayload, { merge: true });
       state.metaDirty = false;
     }
 
@@ -1008,6 +1045,12 @@ async function loadFromCloud(replace) {
           const nd = normalizeDate(x);
           if (isValidDate(nd) && state.savedMonths.indexOf(nd) === -1) state.savedMonths.push(nd);
         });
+      }
+      const emailKey = String((currentUser && currentUser.email) || "").trim().toLowerCase();
+      if (emailKey && m.officers && typeof m.officers === "object" && m.officers[emailKey]) {
+        const cloudOfficer = m.officers[emailKey];
+        if (typeof cloudOfficer.officerName === "string") state.officerName = cloudOfficer.officerName;
+        if (typeof cloudOfficer.serviceNo === "string") state.serviceNo = cloudOfficer.serviceNo;
       }
       return;
     }
@@ -1361,11 +1404,14 @@ function renderEditor() {
   if (g.mode === "balance") {
     renderItems();
     const c = calcGl(g);
-    const showDiffBox = !!g.override || c.diff !== 0 || String(g.diffNote || "").trim() !== "";
+    const notePlain = plainTextFromHtml(g.diffNote || "");
+    const showDiffBox = !!g.override || c.diff !== 0 || notePlain !== "";
     $("chkOverride").checked = showDiffBox;
     $("overrideFields").classList.toggle("hidden", !showDiffBox);
-    $("glBalanceInput").value = c.hasSysGl ? formatMoney(c.gl) : "";
-    $("diffNote").value = g.diffNote || "";
+    $("glBalanceInput").value = getSystemGlRaw(g);
+    if (document.activeElement !== $("diffNote")) {
+      $("diffNote").innerHTML = sanitizeRichNoteHtml(g.diffNote || "");
+    }
   }
   updateTotals();
 }
@@ -1399,37 +1445,38 @@ function updateTotals() {
   if (!no || !GL_BY_NO[no]) return;
   const g = readGl(no);
   const c = calcGl(g);
-  const note = String(g.diffNote || "").trim();
+  const notePlain = plainTextFromHtml(g.diffNote || "");
+  const noteHtml = sanitizeRichNoteHtml(g.diffNote || "");
 
   $("itemsTotal").textContent = formatMoney(c.tb);
   $("tbTotal").textContent = formatMoney(c.tb);
 
   const glInput = $("glBalanceInput");
   if (glInput) {
-    glInput.value = c.hasSysGl ? formatMoney(c.gl) : "";
-    glInput.placeholder = "Enter in GL Balances (" + formatMoney(c.tb) + ")";
+    if (document.activeElement !== glInput) {
+      glInput.value = getSystemGlRaw(g);
+    }
+    glInput.placeholder = formatMoney(c.tb);
   }
   if ($("glBalanceSourceHint")) {
     $("glBalanceSourceHint").textContent = c.hasSysGl
-      ? "Fixed from system (entered in GL Balances tab)"
-      : "Not entered in GL Balances yet — using Trial Balance sum";
+      ? "System GL Balance: Rs. " + formatMoney(c.gl)
+      : "Defaulting to Trial Balance (" + formatMoney(c.tb) + ") — type here or in GL Balances";
   }
 
   $("glBalanceAuto").textContent = c.diff === 0
-    ? "Nil (0.00)"
-    : (c.diff > 0 ? "+" : "-") + formatMoney(Math.abs(c.diff));
+    ? "Nil"
+    : numberToWords(Math.abs(c.diff) / 100);
   $("glBalanceAuto").classList.toggle("has-difference", c.hasDiscrepancy);
 
   if (c.diff === 0 && !c.hasDiscrepancy) {
     $("glBalanceAutoHint").textContent = c.hasSysGl
       ? "System GL (" + formatMoney(c.gl) + ") tallies with Trial Balance."
       : "Using Trial Balance (" + formatMoney(c.tb) + "). Difference: Nil";
-  } else if (c.diff > 0) {
-    $("glBalanceAutoHint").textContent = "System GL (" + formatMoney(c.gl) + ") > Trial Balance (" + formatMoney(c.tb) + ")";
-  } else if (c.diff < 0) {
-    $("glBalanceAutoHint").textContent = "Trial Balance (" + formatMoney(c.tb) + ") > System GL (" + formatMoney(c.gl) + ")";
+  } else if (c.diff !== 0) {
+    $("glBalanceAutoHint").textContent = "Diff: " + (c.diff > 0 ? "+" : "-") + formatMoney(Math.abs(c.diff)) + " (GL: " + formatMoney(c.gl) + " vs TB: " + formatMoney(c.tb) + ")";
   } else {
-    $("glBalanceAutoHint").textContent = "Enter the actual System GL Balance in GL Balances tab.";
+    $("glBalanceAutoHint").textContent = "Enter the actual System GL Balance.";
   }
 
   const badge = $("reconcileBadge");
@@ -1437,20 +1484,20 @@ function updateTotals() {
     if (c.hasDiscrepancy) {
       badge.className = "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-stamp-tint text-stamp border border-stamp/30";
       badge.innerHTML = '<i class="fa-solid fa-triangle-exclamation"></i> ' +
-        (c.diff !== 0 ? "Difference: Rs. " + formatMoney(Math.abs(c.diff)) : "Difference Marked");
+        (c.diff !== 0 ? "Difference: " + numberToWords(Math.abs(c.diff) / 100) : "Difference Marked");
     } else {
       badge.className = "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-ledger-tint text-ledger border border-ledger/20";
       badge.innerHTML = '<i class="fa-solid fa-circle-check"></i> Tallied (GL = TB)';
     }
   }
 
-  const showDiffBox = !!g.override || c.diff !== 0 || note !== "";
+  const showDiffBox = !!g.override || c.diff !== 0 || notePlain !== "";
   $("chkOverride").checked = showDiffBox;
   $("overrideFields").classList.toggle("hidden", !showDiffBox);
 
   const warnBox = $("diffLogicWarning");
   if (warnBox) {
-    warnBox.classList.toggle("hidden", !((g.override || note !== "") && c.diff === 0));
+    warnBox.classList.toggle("hidden", !((g.override || notePlain !== "") && c.diff === 0));
   }
 
   $("tbWords").textContent = numberToWords(c.tb / 100);
@@ -1462,10 +1509,21 @@ function updateTotals() {
   $("diffPreview").classList.toggle("text-stamp", c.hasDiscrepancy);
   $("diffPreview").classList.toggle("font-bold", c.hasDiscrepancy);
 
-  $("certGlNo").textContent = no;
-  $("certDate").textContent = state.tbDate || "YYYY.MM.DD";
-  $("certPreview").classList.toggle("hidden", c.hasDiscrepancy);
-  if ($("certOmittedNotice")) $("certOmittedNotice").classList.toggle("hidden", !c.hasDiscrepancy);
+  if (!c.hasDiscrepancy) {
+    $("certPreview").textContent =
+      "We hereby certify that the total balance of GL Account No." + no +
+      " has been duly verified and tallied with the total amount of the corresponding Trial Balance as at " + (state.tbDate || "YYYY.MM.DD");
+    $("certPreview").classList.remove("hidden");
+    if ($("certOmittedNotice")) $("certOmittedNotice").classList.add("hidden");
+  } else if (notePlain !== "") {
+    $("certPreview").innerHTML = noteHtml;
+    $("certPreview").classList.remove("hidden");
+    if ($("certOmittedNotice")) $("certOmittedNotice").classList.add("hidden");
+  } else {
+    $("certPreview").innerHTML = "";
+    $("certPreview").classList.add("hidden");
+    if ($("certOmittedNotice")) $("certOmittedNotice").classList.remove("hidden");
+  }
 
   $("sigPrepared").textContent = state.officerName || "-";
   $("itemCount").textContent = plural(g.items.length, "item");
@@ -1673,7 +1731,7 @@ function updateTargetMonthBalance(glNo, rawValue) {
     else if (cents === 0 && cleanItems(g).length === 0) g.mode = "zero";
   }
   const c = calcGl(g);
-  g.override = c.diff !== 0 || String(g.diffNote || "").trim() !== "";
+  g.override = c.diff !== 0 || plainTextFromHtml(g.diffNote || "") !== "";
   markDirty(glNo);
 }
 
@@ -1782,12 +1840,24 @@ function bindEvents() {
     else if (e.key === "2") { switchView("balances"); }
   });
 
-  /* Officer details */
+  /* Officer details (saved per Gmail in local storage and Firestore DB) */
   $("officerToggle").addEventListener("click", function () {
     setOfficerBarOpen(!$("officerBar").classList.contains("is-open"));
   });
-  $("officerName").addEventListener("input", function (e) { state.officerName = e.target.value; persistSoon(); schedule("totals", "counts"); });
-  $("serviceNo").addEventListener("input", function (e) { state.serviceNo = e.target.value; persistSoon(); });
+  $("officerName").addEventListener("input", function (e) {
+    state.officerName = e.target.value;
+    state.metaDirty = true;
+    persistSoon();
+    saveOfficerProfileSoon();
+    schedule("totals", "counts", "badge");
+  });
+  $("serviceNo").addEventListener("input", function (e) {
+    state.serviceNo = e.target.value;
+    state.metaDirty = true;
+    persistSoon();
+    saveOfficerProfileSoon();
+    schedule("counts", "badge");
+  });
   $("officerName").addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); $("serviceNo").focus(); } });
 
   function openMonthSettingsDialog() {
@@ -2049,7 +2119,23 @@ function bindEvents() {
     });
   });
 
-  /* System GL Balance & Difference handling */
+  /* System GL Balance & Rich-Text Optional Note handling */
+  if ($("glBalanceInput")) {
+    $("glBalanceInput").addEventListener("input", function (e) {
+      const no = state.activeGl;
+      if (!no) return;
+      const g = ensureGl(no);
+      const clean = String(e.target.value).trim();
+      g.targetMonthBalance = clean;
+      g.glBalance = clean;
+      const bad = clean !== "" && isNaN(parseAmount(clean));
+      e.target.classList.toggle("is-invalid", bad);
+      const c = calcGl(g);
+      g.override = c.diff !== 0 || plainTextFromHtml(g.diffNote || "") !== "";
+      markDirty(no);
+      schedule("totals", "list", "balances", "counts");
+    });
+  }
   $("chkOverride").addEventListener("change", function (e) {
     const no = state.activeGl;
     if (!no) return;
@@ -2058,7 +2144,7 @@ function bindEvents() {
     const c = calcGl(g);
     if (!g.override && c.diff === 0) {
       g.diffNote = "";
-      $("diffNote").value = "";
+      $("diffNote").innerHTML = "";
     }
     const showDiffBox = g.override || c.diff !== 0;
     $("overrideFields").classList.toggle("hidden", !showDiffBox);
@@ -2066,14 +2152,171 @@ function bindEvents() {
     markDirty(no);
     schedule("totals", "list");
   });
-  $("diffNote").addEventListener("input", function (e) {
+
+  /* Rich Text Editor for Optional Note (#diffNote) */
+  const RT_SIZES = [8, 9, 10, 11, 12, 14, 16, 18];
+  let savedRtRange = null;
+
+  function saveRtSelection() {
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return;
+    const r = sel.getRangeAt(0);
+    if ($("diffNote") && $("diffNote").contains(r.commonAncestorContainer)) {
+      savedRtRange = r.cloneRange();
+    }
+  }
+
+  function restoreRtSelection() {
+    const ed = $("diffNote");
+    if (!ed) return;
+    ed.focus();
+    if (savedRtRange) {
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(savedRtRange);
+    }
+  }
+
+  function currentSelectionPt() {
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return 10;
+    let node = sel.anchorNode;
+    if (node && node.nodeType === 3) node = node.parentElement;
+    while (node && node !== $("diffNote")) {
+      if (node.getAttribute && node.getAttribute("data-pt")) {
+        const pt = parseFloat(node.getAttribute("data-pt"));
+        if (!isNaN(pt)) return pt;
+      }
+      if (node.style && node.style.fontSize) {
+        const m = String(node.style.fontSize).match(/^([\d.]+)\s*pt$/i);
+        if (m) return parseFloat(m[1]);
+      }
+      node = node.parentElement;
+    }
+    return 10;
+  }
+
+  function updateRtToolbarState() {
+    if (!$("diffNoteToolbar")) return;
+    ["bold", "italic", "underline", "insertUnorderedList", "insertOrderedList"].forEach(function (cmd) {
+      const btn = $("diffNoteToolbar").querySelector('[data-rt-cmd="' + cmd + '"]');
+      if (!btn) return;
+      let on = false;
+      try { on = document.queryCommandState(cmd); } catch (e) {}
+      btn.classList.toggle("is-active", !!on);
+    });
+    const pt = currentSelectionPt();
+    if ($("rtFontSizeSelect") && document.activeElement !== $("rtFontSizeSelect")) {
+      $("rtFontSizeSelect").value = String(RT_SIZES.indexOf(pt) !== -1 ? pt : 10);
+    }
+  }
+
+  function syncDiffNoteFromDom() {
     const no = state.activeGl;
     if (!no) return;
     const g = ensureGl(no);
-    g.diffNote = e.target.value;
-    if (e.target.value.trim() !== "") g.override = true;
+    const plain = plainTextFromHtml($("diffNote").innerHTML);
+    g.diffNote = plain ? sanitizeRichNoteHtml($("diffNote").innerHTML) : "";
+    if (plain !== "") g.override = true;
     markDirty(no);
     schedule("totals", "list");
+  }
+
+  function applyRtFontSize(pt) {
+    const ed = $("diffNote");
+    if (!ed) return;
+    restoreRtSelection();
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return;
+    const range = sel.getRangeAt(0);
+    if (!ed.contains(range.commonAncestorContainer)) return;
+
+    if (range.collapsed) {
+      // Insert a styled zero-width space so newly typed characters get this size
+      const span = document.createElement("span");
+      span.setAttribute("data-pt", String(pt));
+      span.style.fontSize = pt + "pt";
+      span.innerHTML = "&#8203;";
+      range.insertNode(span);
+      const nr = document.createRange();
+      nr.setStart(span.firstChild, 1);
+      nr.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(nr);
+      savedRtRange = nr.cloneRange();
+    } else {
+      document.execCommand("fontSize", false, "7");
+      const fonts = ed.querySelectorAll('font[size="7"]');
+      fonts.forEach(function (f) {
+        const span = document.createElement("span");
+        span.setAttribute("data-pt", String(pt));
+        span.style.fontSize = pt + "pt";
+        while (f.firstChild) span.appendChild(f.firstChild);
+        f.parentNode.replaceChild(span, f);
+      });
+      saveRtSelection();
+    }
+    if ($("rtFontSizeSelect")) $("rtFontSizeSelect").value = String(pt);
+    syncDiffNoteFromDom();
+  }
+
+  if ($("diffNoteToolbar")) {
+    $("diffNoteToolbar").addEventListener("mousedown", function (e) {
+      if (e.target.closest("button")) {
+        e.preventDefault(); // keep text selection inside #diffNote
+      }
+    });
+    $("diffNoteToolbar").addEventListener("click", function (e) {
+      const cmdBtn = e.target.closest("[data-rt-cmd]");
+      if (cmdBtn) {
+        const cmd = cmdBtn.dataset.rtCmd;
+        restoreRtSelection();
+        document.execCommand(cmd, false, null);
+        if (cmd === "removeFormat") {
+          // Also strip custom font-size spans inside selection
+          const sel = window.getSelection();
+          if (sel && sel.rangeCount) {
+            $("diffNote").querySelectorAll("span[data-pt]").forEach(function (sp) {
+              if (sel.containsNode(sp, true)) {
+                sp.removeAttribute("data-pt");
+                sp.style.fontSize = "";
+              }
+            });
+          }
+        }
+        saveRtSelection();
+        updateRtToolbarState();
+        syncDiffNoteFromDom();
+        return;
+      }
+      const stepBtn = e.target.closest("[data-rt-size-step]");
+      if (stepBtn) {
+        const step = +stepBtn.dataset.rtSizeStep;
+        const curPt = currentSelectionPt();
+        let idx = RT_SIZES.indexOf(curPt);
+        if (idx === -1) idx = RT_SIZES.indexOf(10);
+        const nextIdx = Math.max(0, Math.min(RT_SIZES.length - 1, idx + step));
+        applyRtFontSize(RT_SIZES[nextIdx]);
+      }
+    });
+  }
+  if ($("rtFontSizeSelect")) {
+    $("rtFontSizeSelect").addEventListener("change", function (e) {
+      const pt = parseFloat(e.target.value) || 10;
+      applyRtFontSize(pt);
+    });
+  }
+
+  $("diffNote").addEventListener("input", function () {
+    saveRtSelection();
+    updateRtToolbarState();
+    syncDiffNoteFromDom();
+  });
+  ["keyup", "mouseup", "focus"].forEach(function (ev) {
+    $("diffNote").addEventListener(ev, function () {
+      saveRtSelection();
+      updateRtToolbarState();
+    });
   });
 
   /* GL Balances view */
@@ -2283,7 +2526,11 @@ async function handleImport(fileList) {
         items.forEach(function (it) { const n = parseAmount(it.amount); if (!isNaN(n)) tb += toCents(n); });
         const glCents = b.glBalance != null ? toCents(b.glBalance) : (b.tbBalance != null ? toCents(b.tbBalance) : tb);
         const override = glCents !== tb;
-        const note = /^nil$/i.test(String(b.diffText || "").trim()) ? "" : String(b.diffText || "").trim();
+        const autoDiffWords = numberToWords(Math.abs(glCents - tb) / 100);
+        const rawNote = String(b.diffNote || b.diffText || "").trim();
+        const note = (/^nil$/i.test(rawNote) || rawNote.toLowerCase() === autoDiffWords.toLowerCase() || !isNaN(parseAmount(rawNote)))
+          ? ""
+          : rawNote;
         const monthEnd = normalizeDate(manualMonthEnd || b.tbDate || "");
 
         if (!isValidDate(monthEnd)) {
@@ -2471,6 +2718,7 @@ async function collectExportParams() {
       tbCents: c.tb,
       glCents: c.gl,
       diffText: differenceText(g, c),
+      diffNote: String(g.diffNote || "").trim(),
       hasDiscrepancy: c.hasDiscrepancy
     };
   });

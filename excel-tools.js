@@ -158,6 +158,266 @@ export function isValidDate(s) {
 
 
 /* ==========================================================================
+   RICH TEXT HELPERS FOR OPTIONAL NOTE (HTML <-> Excel RichText & PDF)
+   Supports Bold, Italic, Underline, per-selection Font Size (pt),
+   Bulleted Lists (<ul><li>), and Numbered Lists (<ol><li>).
+   ========================================================================== */
+const HTML_ESC_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+function escHtml(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return HTML_ESC_MAP[c]; });
+}
+
+export function plainTextFromHtml(html) {
+  const raw = String(html == null ? "" : html);
+  if (!raw.trim()) return "";
+  if (!/<[a-z][\s\S]*>/i.test(raw)) return raw.trim();
+  if (typeof DOMParser !== "undefined") {
+    const doc = new DOMParser().parseFromString(raw, "text/html");
+    return (doc.body.textContent || "").replace(/\u00a0/g, " ").trim();
+  }
+  return raw.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function parsePtSize(el, fallback) {
+  if (!el || !el.getAttribute) return fallback;
+  const dataPt = parseFloat(el.getAttribute("data-pt"));
+  if (!isNaN(dataPt) && dataPt >= 6 && dataPt <= 36) return dataPt;
+  const st = el.style && el.style.fontSize ? String(el.style.fontSize).trim() : "";
+  if (st) {
+    const m = st.match(/^([\d.]+)\s*(pt|px)?$/i);
+    if (m) {
+      const val = parseFloat(m[1]);
+      const unit = (m[2] || "pt").toLowerCase();
+      const pt = unit === "px" ? Math.round(val * 0.75 * 2) / 2 : val;
+      if (pt >= 6 && pt <= 36) return pt;
+    }
+  }
+  const fSize = el.getAttribute("size");
+  if (fSize) {
+    const map = { "1": 8, "2": 9, "3": 10, "4": 12, "5": 14, "6": 16, "7": 18 };
+    if (map[fSize]) return map[fSize];
+  }
+  return fallback;
+}
+
+export function sanitizeRichNoteHtml(input) {
+  const raw = String(input == null ? "" : input).trim();
+  if (!raw) return "";
+  if (!/<[a-z][\s\S]*>/i.test(raw)) {
+    return escHtml(raw).replace(/\r?\n/g, "<br>");
+  }
+  if (typeof DOMParser === "undefined") return raw;
+  const doc = new DOMParser().parseFromString(raw, "text/html");
+
+  function cleanNode(node) {
+    if (node.nodeType === 3) {
+      return escHtml(node.nodeValue || "");
+    }
+    if (node.nodeType !== 1) return "";
+    const tag = node.tagName.toUpperCase();
+    if (tag === "SCRIPT" || tag === "STYLE") return "";
+    if (tag === "BR") return "<br>";
+
+    let inner = "";
+    for (let i = 0; i < node.childNodes.length; i++) {
+      inner += cleanNode(node.childNodes[i]);
+    }
+
+    const pt = parsePtSize(node, null);
+    const wrapSize = function (content) {
+      return pt ? '<span data-pt="' + pt + '" style="font-size:' + pt + 'pt">' + content + "</span>" : content;
+    };
+
+    if (tag === "B" || tag === "STRONG") return wrapSize("<b>" + inner + "</b>");
+    if (tag === "I" || tag === "EM")     return wrapSize("<i>" + inner + "</i>");
+    if (tag === "U")                     return wrapSize("<u>" + inner + "</u>");
+    if (tag === "UL")                    return "<ul>" + inner + "</ul>";
+    if (tag === "OL")                    return "<ol>" + inner + "</ol>";
+    if (tag === "LI")                    return "<li>" + wrapSize(inner) + "</li>";
+    if (tag === "P" || tag === "DIV")    return "<div>" + wrapSize(inner) + "</div>";
+    if (tag === "SPAN" || tag === "FONT") {
+      let res = inner;
+      const fw = node.style && node.style.fontWeight;
+      if (fw === "bold" || Number(fw) >= 600) res = "<b>" + res + "</b>";
+      if (node.style && node.style.fontStyle === "italic") res = "<i>" + res + "</i>";
+      if (node.style && node.style.textDecoration && node.style.textDecoration.indexOf("underline") !== -1) res = "<u>" + res + "</u>";
+      return wrapSize(res);
+    }
+    return wrapSize(inner);
+  }
+
+  let out = "";
+  for (let i = 0; i < doc.body.childNodes.length; i++) {
+    out += cleanNode(doc.body.childNodes[i]);
+  }
+  return out;
+}
+
+/**
+ * Parses rich-text HTML (or plain text) into paragraph blocks:
+ *   [{ prefix: "" | "• " | "1. ", indentMm: 0 | 5, runs: [{ text, bold, italic, underline, size }] }]
+ */
+export function parseRichNoteBlocks(input, defaultSize) {
+  defaultSize = defaultSize || STYLE.certFontSize || 10;
+  const raw = String(input == null ? "" : input).trim();
+  if (!raw) return [];
+
+  const html = sanitizeRichNoteHtml(raw);
+  if (typeof DOMParser === "undefined") {
+    return raw.split(/\r?\n/).map(function (line) {
+      return { prefix: "", indentMm: 0, runs: [{ text: line, bold: false, italic: false, underline: false, size: defaultSize }] };
+    });
+  }
+
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const blocks = [];
+  let cur = { prefix: "", indentMm: 0, runs: [] };
+
+  function pushRun(text, style) {
+    if (!text) return;
+    const clean = text.replace(/\u00a0/g, " ");
+    if (!clean) return;
+    const prev = cur.runs[cur.runs.length - 1];
+    if (prev && prev.bold === style.bold && prev.italic === style.italic && prev.underline === style.underline && prev.size === style.size) {
+      prev.text += clean;
+    } else {
+      cur.runs.push({
+        text: clean,
+        bold: !!style.bold,
+        italic: !!style.italic,
+        underline: !!style.underline,
+        size: style.size || defaultSize
+      });
+    }
+  }
+
+  function flushBlock() {
+    if (cur.runs.length > 0 || cur.prefix) {
+      blocks.push(cur);
+      cur = { prefix: "", indentMm: 0, runs: [] };
+    }
+  }
+
+  function walk(node, style) {
+    if (node.nodeType === 3) {
+      const parts = (node.nodeValue || "").replace(/\r/g, "").split("\n");
+      for (let i = 0; i < parts.length; i++) {
+        if (i > 0) flushBlock();
+        if (parts[i]) pushRun(parts[i], style);
+      }
+      return;
+    }
+    if (node.nodeType !== 1) return;
+    const tag = node.tagName.toUpperCase();
+    if (tag === "BR") {
+      flushBlock();
+      return;
+    }
+
+    const nextStyle = {
+      bold: style.bold || tag === "B" || tag === "STRONG",
+      italic: style.italic || tag === "I" || tag === "EM",
+      underline: style.underline || tag === "U",
+      size: parsePtSize(node, style.size)
+    };
+
+    if (tag === "UL" || tag === "OL") {
+      flushBlock();
+      let idx = 1;
+      for (let i = 0; i < node.childNodes.length; i++) {
+        const child = node.childNodes[i];
+        if (child.nodeType === 1 && child.tagName.toUpperCase() === "LI") {
+          flushBlock();
+          cur = {
+            prefix: tag === "OL" ? (idx++ + ". ") : "\u2022 ",
+            indentMm: 5,
+            runs: []
+          };
+          const liStyle = {
+            bold: nextStyle.bold,
+            italic: nextStyle.italic,
+            underline: nextStyle.underline,
+            size: parsePtSize(child, nextStyle.size)
+          };
+          for (let j = 0; j < child.childNodes.length; j++) {
+            walk(child.childNodes[j], liStyle);
+          }
+          flushBlock();
+        }
+      }
+      return;
+    }
+
+    if (tag === "P" || tag === "DIV" || tag === "LI") {
+      flushBlock();
+      if (tag === "LI") {
+        cur.prefix = "\u2022 ";
+        cur.indentMm = 5;
+      }
+      for (let i = 0; i < node.childNodes.length; i++) {
+        walk(node.childNodes[i], nextStyle);
+      }
+      flushBlock();
+      return;
+    }
+
+    for (let i = 0; i < node.childNodes.length; i++) {
+      walk(node.childNodes[i], nextStyle);
+    }
+  }
+
+  walk(doc.body, { bold: false, italic: false, underline: false, size: defaultSize });
+  flushBlock();
+
+  return blocks.filter(function (b) {
+    return b.runs.some(function (r) { return r.text.trim() !== ""; });
+  });
+}
+
+function blocksToExcelRichText(blocks, fontName, defaultSize) {
+  const richText = [];
+  blocks.forEach(function (b, bIdx) {
+    const firstSize = (b.runs[0] && b.runs[0].size) || defaultSize;
+    if (bIdx > 0) {
+      richText.push({ font: { name: fontName, size: firstSize }, text: "\n" });
+    }
+    if (b.prefix) {
+      richText.push({ font: { name: fontName, size: firstSize, bold: true }, text: b.prefix });
+    }
+    b.runs.forEach(function (r) {
+      const f = {
+        name: fontName,
+        size: r.size || defaultSize,
+        bold: !!r.bold,
+        italic: !!r.italic
+      };
+      if (r.underline) f.underline = true;
+      richText.push({ font: f, text: r.text });
+    });
+  });
+  return richText;
+}
+
+function richCellToHtml(cell) {
+  const v = cell && cell.value;
+  if (v && typeof v === "object" && Array.isArray(v.richText)) {
+    return v.richText.map(function (seg) {
+      let t = escHtml(seg.text || "").replace(/\r?\n/g, "<br>");
+      const f = seg.font || {};
+      if (f.bold) t = "<b>" + t + "</b>";
+      if (f.italic) t = "<i>" + t + "</i>";
+      if (f.underline) t = "<u>" + t + "</u>";
+      if (f.size && f.size !== STYLE.certFontSize) {
+        t = '<span data-pt="' + f.size + '" style="font-size:' + f.size + 'pt">' + t + "</span>";
+      }
+      return t;
+    }).join("");
+  }
+  return textOf(cell);
+}
+
+
+/* ==========================================================================
    PASTE PARSER (tab separated text copied from Excel)
    Layout A: Date | Reference | Description | Amount
    Layout B: Serial No | Date | Reference | Description | Amount
@@ -279,9 +539,11 @@ export async function parseWorkbookFile(file) {
         glBalance: null,
         tbBalance: null,
         diffText: "",
+        diffNote: "",
         sheet: ws.name
       };
       let headerRow = 0;
+      let seenDiffRow = false;
 
       // Also check 1-2 rows above startRow in case Trial Balance Date is above GL Account row
       for (let preR = Math.max(1, startRow - 2); preR < startRow; preR++) {
@@ -295,7 +557,8 @@ export async function parseWorkbookFile(file) {
 
       for (let r = startRow + 1; r <= endRow; r++) {
         const row = ws.getRow(r);
-        const a = textOf(row.getCell(1)).toLowerCase();
+        const rawA = textOf(row.getCell(1));
+        const a = rawA.toLowerCase();
 
         if ((a.indexOf("trial balance date") === 0 || a.indexOf("date as at") !== -1) && !block.tbDate) {
           const dv = rowValueAfterLabel(row);
@@ -313,6 +576,7 @@ export async function parseWorkbookFile(file) {
         } else if (a.indexOf("difference") === 0) {
           const t = textOf(row.getCell(5)) || textOf(row.getCell(4));
           block.diffText = t;
+          seenDiffRow = true;
         } else if (headerRow > 0) {
           const dateV = rawValue(row.getCell(2));
           const refV  = rawValue(row.getCell(3));
@@ -327,10 +591,13 @@ export async function parseWorkbookFile(file) {
             desc: descV == null ? "" : String(descV).trim(),
             amount: isNaN(n) ? "" : String(Math.round(n * 100) / 100)
           });
-        } else if (!block.tbDate && a.indexOf("we hereby certify") === 0) {
-          // Fallback: extract date at the end of certification text ("... as at YYYY.MM.DD")
-          const certDateMatch = textOf(row.getCell(1)).match(/as at\s+(\d{4}[.\-\/]\d{1,2}[.\-\/]\d{1,2})/i);
-          if (certDateMatch) block.tbDate = normalizeDate(certDateMatch[1]);
+        } else if (a.indexOf("we hereby certify") === 0) {
+          // Extract date at the end of certification text ("... as at YYYY.MM.DD")
+          const certDateMatch = rawA.match(/as at\s+(\d{4}[.\-\/]\d{1,2}[.\-\/]\d{1,2})/i);
+          if (certDateMatch && !block.tbDate) block.tbDate = normalizeDate(certDateMatch[1]);
+        } else if (seenDiffRow && rawA && !block.diffNote &&
+                   a.indexOf("prepared by") !== 0 && a.indexOf("checked by") !== 0 && a.indexOf("audit officer") !== 0) {
+          block.diffNote = richCellToHtml(row.getCell(1));
         }
       }
       blocks.push(block);
@@ -458,7 +725,10 @@ function writeBlock(ws, startRow, params, block) {
   r++;
   const tbWords = isZero ? "Zero Only" : numberToWords(tbValue);
   const glWords = isZero ? "Zero Only" : numberToWords(glValue);
-  const diffText = isZero ? "NIL" : (block.diffText || "Nil");
+  const diffCents = Math.abs(block.glCents - block.tbCents);
+  const diffText = isZero
+    ? "NIL"
+    : (diffCents !== 0 ? numberToWords(diffCents / 100) : "Nil");
 
   [
     ["Trial Balance Amount in Words",              tbWords],
@@ -475,8 +745,7 @@ function writeBlock(ws, startRow, params, block) {
     r++;
   });
 
-  // ---- Blank row, then certification (3 rows x 5 columns, wrapped)
-  //      ONLY included when GL Balance and Trial Balance tally (no difference) ----
+  // ---- Blank row, then Certification (when tallied) OR Rich-Text Optional Note (when imbalanced) ----
   if (!block.hasDiscrepancy) {
     r++;
     put(ws, r, 1, r + 2, 5,
@@ -484,6 +753,20 @@ function writeBlock(ws, startRow, params, block) {
       " has been duly verified and tallied with the total amount of the corresponding Trial Balance as at " + params.tbDate,
       { align: "left", valign: "middle", wrap: true, size: STYLE.certFontSize, border: false });
     r += 3;
+  } else {
+    const noteBlocks = parseRichNoteBlocks(block.diffNote || "", STYLE.certFontSize);
+    if (noteBlocks.length) {
+      r++;
+      const richRuns = blocksToExcelRichText(noteBlocks, STYLE.fontName, STYLE.certFontSize);
+      const spanRows = Math.max(3, noteBlocks.length + 1);
+      put(ws, r, 1, r + spanRows - 1, 5,
+        { richText: richRuns },
+        { align: "left", valign: "middle", wrap: true, size: STYLE.certFontSize, border: false });
+      for (let i = 0; i < spanRows; i++) {
+        ws.getRow(r + i).height = Math.max(18, Math.ceil((noteBlocks.length * 16) / spanRows));
+      }
+      r += spanRows;
+    }
   }
 
   // ---- Blank row, then 1 single merged signature box (2*h rows x 5 columns)
@@ -719,9 +1002,17 @@ const SANSATION_FONT_URLS = {
   bold: [
     "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/sansation/Sansation-Bold.ttf",
     "https://raw.githubusercontent.com/google/fonts/main/ofl/sansation/Sansation-Bold.ttf"
+  ],
+  italic: [
+    "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/sansation/Sansation-Italic.ttf",
+    "https://raw.githubusercontent.com/google/fonts/main/ofl/sansation/Sansation-Italic.ttf"
+  ],
+  bolditalic: [
+    "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/sansation/Sansation-BoldItalic.ttf",
+    "https://raw.githubusercontent.com/google/fonts/main/ofl/sansation/Sansation-BoldItalic.ttf"
   ]
 };
-const fontBase64Cache = { normal: null, bold: null };
+const fontBase64Cache = { normal: null, bold: null, italic: null, bolditalic: null };
 
 function arrayBufferToBase64(buffer) {
   const bytes = new Uint8Array(buffer);
@@ -751,22 +1042,124 @@ async function registerSansationFont(doc) {
     if (!fontBase64Cache.normal) {
       const loaded = await Promise.all([
         fetchFontBase64(SANSATION_FONT_URLS.normal),
-        fetchFontBase64(SANSATION_FONT_URLS.bold)
+        fetchFontBase64(SANSATION_FONT_URLS.bold),
+        fetchFontBase64(SANSATION_FONT_URLS.italic),
+        fetchFontBase64(SANSATION_FONT_URLS.bolditalic)
       ]);
       fontBase64Cache.normal = loaded[0];
       fontBase64Cache.bold = loaded[1] || loaded[0];
+      fontBase64Cache.italic = loaded[2] || loaded[0];
+      fontBase64Cache.bolditalic = loaded[3] || loaded[1] || loaded[0];
     }
     if (fontBase64Cache.normal) {
       doc.addFileToVFS("Sansation-Regular.ttf", fontBase64Cache.normal);
       doc.addFont("Sansation-Regular.ttf", "Sansation", "normal");
       doc.addFileToVFS("Sansation-Bold.ttf", fontBase64Cache.bold || fontBase64Cache.normal);
       doc.addFont("Sansation-Bold.ttf", "Sansation", "bold");
+      doc.addFileToVFS("Sansation-Italic.ttf", fontBase64Cache.italic || fontBase64Cache.normal);
+      doc.addFont("Sansation-Italic.ttf", "Sansation", "italic");
+      doc.addFileToVFS("Sansation-BoldItalic.ttf", fontBase64Cache.bolditalic || fontBase64Cache.bold || fontBase64Cache.normal);
+      doc.addFont("Sansation-BoldItalic.ttf", "Sansation", "bolditalic");
       return "Sansation";
     }
   } catch (e) {
     console.warn("Could not register Sansation font for PDF, using fallback:", e);
   }
   return "helvetica";
+}
+
+/**
+ * Renders (or dry-run measures) rich-text paragraph blocks onto a jsPDF document.
+ * Preserves Bold, Italic, Underline, per-selection Font Size (pt), Bullets, and Numbered Lists.
+ * Returns total height in mm.
+ */
+function renderRichNotePdf(doc, noteBlocks, startX, startY, maxWidth, pdfFont, dryRun) {
+  let y = startY;
+  doc.setTextColor(22, 35, 46);
+  doc.setDrawColor(22, 35, 46);
+
+  function fontStyleOf(bold, italic) {
+    if (bold && italic) return "bolditalic";
+    if (bold) return "bold";
+    if (italic) return "italic";
+    return "normal";
+  }
+
+  noteBlocks.forEach(function (para) {
+    const indent = para.indentMm || 0;
+    const availW = Math.max(20, maxWidth - indent);
+    const firstSize = (para.runs[0] && para.runs[0].size) || 9.5;
+
+    // Split runs into word/whitespace tokens so word-wrapping works across styled spans
+    const tokens = [];
+    para.runs.forEach(function (r) {
+      const chunks = String(r.text || "").match(/(\S+|\s+)/g) || [];
+      chunks.forEach(function (ch) {
+        tokens.push({
+          text: ch,
+          bold: !!r.bold,
+          italic: !!r.italic,
+          underline: !!r.underline,
+          size: r.size || 9.5
+        });
+      });
+    });
+
+    const lines = [];
+    let curLine = [];
+    let curW = 0;
+
+    tokens.forEach(function (tk) {
+      doc.setFont(pdfFont, fontStyleOf(tk.bold, tk.italic));
+      doc.setFontSize(tk.size);
+      const w = doc.getTextWidth(tk.text);
+      if (curLine.length > 0 && curW + w > availW && tk.text.trim() !== "") {
+        lines.push(curLine);
+        curLine = [ { token: tk, width: w } ];
+        curW = w;
+      } else {
+        if (curLine.length === 0 && tk.text.trim() === "") return; // skip leading space on wrapped line
+        curLine.push({ token: tk, width: w });
+        curW += w;
+      }
+    });
+    if (curLine.length > 0) lines.push(curLine);
+    if (lines.length === 0) {
+      lines.push([{ token: { text: "", bold: false, italic: false, underline: false, size: firstSize }, width: 0 }]);
+    }
+
+    lines.forEach(function (lineItems, lineIdx) {
+      let maxPt = firstSize;
+      lineItems.forEach(function (it) { if (it.token.size > maxPt) maxPt = it.token.size; });
+      const lineH = Math.max(4.2, maxPt * 0.3528 * 1.38);
+      const baselineY = y + maxPt * 0.3528;
+
+      if (!dryRun) {
+        if (lineIdx === 0 && para.prefix) {
+          doc.setFont(pdfFont, "bold");
+          doc.setFontSize(firstSize);
+          doc.text(para.prefix, startX, baselineY);
+        }
+        let curX = startX + indent;
+        lineItems.forEach(function (it) {
+          const tk = it.token;
+          if (!tk.text) return;
+          doc.setFont(pdfFont, fontStyleOf(tk.bold, tk.italic));
+          doc.setFontSize(tk.size);
+          doc.text(tk.text, curX, baselineY);
+          if (tk.underline && tk.text.trim() !== "") {
+            doc.setLineWidth(0.22);
+            doc.line(curX, baselineY + 0.65, curX + it.width, baselineY + 0.65);
+          }
+          curX += it.width;
+        });
+      }
+      y += lineH;
+    });
+    y += 0.8; // small gap between paragraphs/list items
+  });
+
+  return Math.max(0, y - startY);
 }
 
 
@@ -805,7 +1198,10 @@ export async function buildAndSavePdf(params, fileName) {
     const glFormatted = formatMoney(isZero ? 0 : block.glCents);
     const tbWords = isZero ? "Zero Only" : numberToWords(tbValue);
     const glWords = isZero ? "Zero Only" : numberToWords(glValue);
-    const diffText = isZero ? "NIL" : (block.diffText || "Nil");
+    const diffCents = Math.abs(block.glCents - block.tbCents);
+    const diffText = isZero
+      ? "NIL"
+      : (diffCents !== 0 ? numberToWords(diffCents / 100) : "Nil");
 
     let curY = margin;
 
@@ -856,7 +1252,7 @@ export async function buildAndSavePdf(params, fileName) {
             formatMoney(toCents(it.amount || 0))
           ];
         })
-      : [["-", "-", "-", isZero ? "Zero Balance Account (No Schedule Items)" : "No items in Trial Balance book", "0.00"]];
+      : [["-", "-", "-", "-", "0.00"]];
 
     doc.autoTable({
       startY: curY,
@@ -925,14 +1321,19 @@ export async function buildAndSavePdf(params, fileName) {
     });
     curY = doc.lastAutoTable.finalY + 4;
 
-    // ---- Ensure Certification (if tallied) + Single Merged Signature Box fit on current page ----
-    const neededHeight = block.hasDiscrepancy ? 50 : 64;
+    const noteBlocks = block.hasDiscrepancy ? parseRichNoteBlocks(block.diffNote || "", 9.5) : [];
+    const noteHeight = noteBlocks.length
+      ? renderRichNotePdf(doc, noteBlocks, margin + 1, curY, contentWidth - 2, pdfFont, true)
+      : 0;
+
+    // ---- Ensure Certification / Optional Note + Single Merged Signature Box fit on current page ----
+    const neededHeight = !block.hasDiscrepancy ? 64 : (noteHeight > 0 ? 52 + noteHeight : 50);
     if (curY + neededHeight > pageHeight - margin) {
       doc.addPage();
       curY = margin;
     }
 
-    // ---- 4. Certification Statement (ONLY when GL Balance and Trial Balance tally) ----
+    // ---- 4. Certification Statement (when tallied) OR Rich-Text Optional Note (when imbalanced) ----
     if (!block.hasDiscrepancy) {
       const certText =
         "We hereby certify that the total balance of GL Account No." + block.glNo +
@@ -943,6 +1344,9 @@ export async function buildAndSavePdf(params, fileName) {
       const splitCert = doc.splitTextToSize(certText, contentWidth - 2);
       doc.text(splitCert, margin + 1, curY + 4);
       curY += Math.max(11, splitCert.length * 4.5 + 3);
+    } else if (noteBlocks.length) {
+      const usedH = renderRichNotePdf(doc, noteBlocks, margin + 1, curY + 0.5, contentWidth - 2, pdfFont, false);
+      curY += Math.max(8, usedH + 3.5);
     } else {
       curY += 2;
     }

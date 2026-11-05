@@ -470,7 +470,61 @@ textarea.field-input { resize: vertical; }
   line-height: 1.55;
   background: #FCFDFD;
 }
-.certificate span { font-family: "IBM Plex Mono", ui-monospace, monospace; font-weight: 600; }
+.certificate .cert-mono { font-family: "IBM Plex Mono", ui-monospace, monospace; font-weight: 600; }
+.certificate ul,
+.rt-editor ul {
+  list-style-type: disc;
+  padding-left: 1.4rem;
+  margin: 0.25rem 0;
+}
+.certificate ol,
+.rt-editor ol {
+  list-style-type: decimal;
+  padding-left: 1.4rem;
+  margin: 0.25rem 0;
+}
+.certificate u,
+.rt-editor u {
+  text-decoration: underline;
+}
+.certificate b, .certificate strong,
+.rt-editor b, .rt-editor strong {
+  font-weight: 700;
+}
+.certificate i, .certificate em,
+.rt-editor i, .rt-editor em {
+  font-style: italic;
+}
+
+/* Rich text toolbar & contenteditable editor for Optional Note */
+.rt-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.75rem;
+  height: 1.75rem;
+  padding: 0 0.35rem;
+  border: 1px solid transparent;
+  border-radius: 0.375rem;
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+  transition: background-color 0.12s, border-color 0.12s, color 0.12s;
+}
+.rt-btn:hover {
+  background: #E2E8F0;
+  border-color: #CBD5E1;
+}
+.rt-btn.is-active {
+  background: var(--ledger-tint);
+  border-color: var(--ledger);
+  color: var(--ledger-dark);
+}
+.rt-editor:empty::before {
+  content: attr(data-placeholder);
+  color: var(--ink-mute);
+  pointer-events: none;
+}
 
 .sig-merged-box {
   padding: 0.75rem;
